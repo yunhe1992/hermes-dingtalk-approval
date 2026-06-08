@@ -12,9 +12,7 @@ Hermes Agent 钉钉互动卡片审批插件。
 ## 安装
 
 ```bash
-hermes plugins install file:///Users/yuyunhe/www/ai/hermes-dingtalk-approval
-# 或发布到 GitHub 后：
-# hermes plugins install yourusername/hermes-dingtalk-approval
+hermes plugins install yunhe1992/hermes-dingtalk-approval --enable
 ```
 
 ## 前置要求
