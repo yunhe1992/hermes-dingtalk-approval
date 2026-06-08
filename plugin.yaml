@@ -1,0 +1,31 @@
+name: dingtalk-approval
+label: DingTalk Approval Cards
+kind: platform
+manifest_version: 1
+version: 1.1.0
+description: >
+  Extends the built-in DingTalk adapter with interactive AI Card approval
+  prompts for dangerous command confirmation. Shows 4 buttons:
+  "Allow Once / Allow Session / Allow Always / Deny".
+  Overrides the built-in dingtalk platform via platform_registry (last-writer-wins).
+  Requires approval_template_id configured in config.yaml platforms.dingtalk.extra.
+author: yuyunhe
+homepage: https://github.com/yuyunhe/hermes-dingtalk-approval
+requires_env:
+  - name: DINGTALK_CLIENT_ID
+    description: "DingTalk App Client ID (AppKey)"
+    prompt: "DingTalk App Client ID"
+    password: false
+  - name: DINGTALK_CLIENT_SECRET
+    description: "DingTalk App Client Secret"
+    prompt: "DingTalk App Client Secret"
+    password: true
+optional_env:
+  - name: DINGTALK_APPROVAL_TEMPLATE_ID
+    description: "AI Card template ID for approval prompts (can also be set in config.yaml platforms.dingtalk.extra.approval_template_id)"
+    prompt: "DingTalk Approval Card Template ID"
+    password: false
+  - name: DINGTALK_ALLOWED_APPROVERS
+    description: "Comma-separated DingTalk staff_id list allowed to click approval buttons. Leave empty to allow anyone."
+    prompt: "Allowed approver user IDs (comma-separated, leave empty for all)"
+    password: false
