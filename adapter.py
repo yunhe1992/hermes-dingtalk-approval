@@ -209,8 +209,32 @@ def _build_card_callback_handler_class() -> type:
 
 # ── Adapter subclass ───────────────────────────────────────────────────────
 
+def _get_base_dingtalk_adapter():
+    """Return the DingTalk adapter from either the new plugin runtime or old core path."""
+    try:
+        from hermes_plugins.dingtalk_platform.adapter import (  # type: ignore[import-not-found]
+            DingTalkAdapter,
+            check_dingtalk_requirements,
+        )
+        return DingTalkAdapter, check_dingtalk_requirements
+    except Exception:
+        pass
+    try:
+        from plugins.platforms.dingtalk.adapter import (  # type: ignore[import-not-found]
+            DingTalkAdapter,
+            check_dingtalk_requirements,
+        )
+        return DingTalkAdapter, check_dingtalk_requirements
+    except Exception:
+        pass
+    from gateway.platforms.dingtalk import (  # type: ignore[import-not-found]
+        DingTalkAdapter,
+        check_dingtalk_requirements,
+    )
+    return DingTalkAdapter, check_dingtalk_requirements
+
 def _build_adapter_class() -> type:
-    from gateway.platforms.dingtalk import DingTalkAdapter
+    DingTalkAdapter, _ = _get_base_dingtalk_adapter()
     from gateway.platforms.base import SendResult
 
     CardCallbackHandlerClass = _build_card_callback_handler_class()
@@ -469,7 +493,7 @@ def _build_adapter_class() -> type:
 
 def check_requirements() -> bool:
     try:
-        from gateway.platforms.dingtalk import check_dingtalk_requirements
+        _, check_dingtalk_requirements = _get_base_dingtalk_adapter()
         return check_dingtalk_requirements()
     except Exception:
         return False
