@@ -432,7 +432,10 @@ def _build_adapter_class() -> type:
                     "[dingtalk-approval] Approval card sent out_track_id=%s session=%s",
                     out_track_id, session_key,
                 )
-                return SendResult(success=True, message_id=out_track_id)
+                # Don't expose out_track_id as message_id — approval cards are
+                # not streaming cards; the gateway would otherwise try to
+                # finalize/edit them via edit_message() and get 400 errors.
+                return SendResult(success=True)
 
             except Exception as e:
                 logger.error("[dingtalk-approval] send_exec_approval failed: %s", e, exc_info=True)
