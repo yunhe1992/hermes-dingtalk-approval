@@ -517,16 +517,45 @@ def register(ctx: Any) -> None:
         logger.error("[dingtalk-approval] Failed to build adapter class: %s", e)
         return
 
+    # Import cron/standalone delivery helpers from the base DingTalk plugin.
+    # The approval plugin overrides 'dingtalk' via last-writer-wins; without
+    # re-passing these, cron jobs that deliver=dingtalk will fail with
+    # "standalone_sender_fn not registered".
+    try:
+        DingTalkBase, _ = _get_base_dingtalk_adapter()
+        from plugins.platforms.dingtalk.adapter import (  # type: ignore[import-not-found]
+            _standalone_send,
+            _apply_yaml_config,
+            interactive_setup,
+            _is_connected,
+        )
+        _extra_kwargs = dict(
+            is_connected=_is_connected,
+            validate_config=_is_connected,
+            required_env=["DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET"],
+            install_hint="pip install 'dingtalk-stream>=0.20' httpx",
+            setup_fn=interactive_setup,
+            apply_yaml_config_fn=_apply_yaml_config,
+            allowed_users_env="DINGTALK_ALLOWED_USERS",
+            allow_all_env="DINGTALK_ALLOW_ALL_USERS",
+            cron_deliver_env_var="DINGTALK_HOME_CHANNEL",
+            standalone_sender_fn=_standalone_send,
+            allow_update_command=True,
+        )
+    except Exception as e:
+        logger.warning("[dingtalk-approval] Could not import cron helpers from base plugin: %s", e)
+        _extra_kwargs = {}
+
     ctx.register_platform(
         name="dingtalk",
         label="DingTalk (approval cards)",
         adapter_factory=lambda cfg: AdapterClass(cfg),
         check_fn=check_requirements,
-        validate_config=validate_config,
         emoji="🔔",
         platform_hint=(
             "You are on DingTalk. Use plain text and markdown. "
             "Dangerous commands show interactive approval cards with buttons."
         ),
+        **_extra_kwargs,
     )
     logger.info("[dingtalk-approval] Registered 'dingtalk' platform with 4-button approval cards")
