@@ -524,11 +524,121 @@ def register(ctx: Any) -> None:
     try:
         DingTalkBase, _ = _get_base_dingtalk_adapter()
         from plugins.platforms.dingtalk.adapter import (  # type: ignore[import-not-found]
-            _standalone_send,
+            _standalone_send as _base_standalone_send,
             _apply_yaml_config,
             interactive_setup,
             _is_connected,
         )
+
+        async def _standalone_send_with_live_fallback(
+            pconfig: Any,
+            chat_id: str,
+            message: str,
+            *,
+            thread_id: Optional[str] = None,
+            media_files: Any = None,
+            force_document: bool = False,
+        ) -> Dict[str, Any]:
+            """Wraps _base_standalone_send: tries DingTalk OpenAPI directly before
+            falling back to the static webhook URL path.
+
+            When no webhook_url is configured, obtain an access token via
+            client_credentials and deliver via DingTalk's robot sendByPage API.
+            This works out-of-process without needing the gateway's live Stream
+            connection.
+            """
+            extra = getattr(pconfig, "extra", {}) or {}
+            client_id = extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID", "")
+            client_secret = extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET", "")
+            webhook_url = extra.get("webhook_url") or os.getenv("DINGTALK_WEBHOOK_URL", "")
+
+            # If webhook_url is set, use the base standalone path directly
+            if webhook_url:
+                return await _base_standalone_send(
+                    pconfig, chat_id, message,
+                    thread_id=thread_id,
+                    media_files=media_files,
+                    force_document=force_document,
+                )
+
+            # No webhook URL — try DingTalk OpenAPI with client_credentials
+            if not (client_id and client_secret):
+                return {"error": "DingTalk not configured. Set DINGTALK_WEBHOOK_URL env var or webhook_url in dingtalk platform extra config."}
+
+            try:
+                import httpx
+            except ImportError:
+                return {"error": "httpx not installed"}
+
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    # 1. Get access token
+                    token_resp = await client.post(
+                        "https://api.dingtalk.com/v1.0/oauth2/accessToken",
+                        json={"appKey": client_id, "appSecret": client_secret},
+                    )
+                    token_resp.raise_for_status()
+                    token_data = token_resp.json()
+                    token = token_data.get("accessToken")
+                    if not token:
+                        return {"error": f"DingTalk token error: {token_data}"}
+
+                    # 2. Send via oToMessages/batchSend or groupMessages/send
+                    # chat_id starting with "cid" is a DingTalk openConversationId.
+                    # - groupMessages/send requires the app to be registered as a robot
+                    #   in DingTalk open platform (not all Stream-mode bots qualify).
+                    # - oToMessages/batchSend sends to a userId list directly and
+                    #   works reliably for Stream-mode bots.
+                    # Strategy: for "cid" chat_ids, resolve the staffId from config
+                    # (extra.home_user_id or DINGTALK_HOME_USER_ID env var), fall back
+                    # to the allowed_approvers first entry, or try groupMessages/send.
+                    payload: Dict[str, Any]
+                    staff_id = (
+                        extra.get("home_user_id")
+                        or os.getenv("DINGTALK_HOME_USER_ID", "")
+                        or (extra.get("allowed_approvers", "") or "").split(",")[0].strip()
+                    )
+
+                    if chat_id.startswith("cid") and staff_id:
+                        endpoint = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+                        payload = {
+                            "robotCode": client_id,
+                            "userIds": [staff_id],
+                            "msgKey": "sampleText",
+                            "msgParam": json.dumps({"content": message}),
+                        }
+                    elif chat_id.startswith("cid"):
+                        # No staffId available, try groupMessages/send
+                        endpoint = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+                        payload = {
+                            "robotCode": client_id,
+                            "openConversationId": chat_id,
+                            "msgKey": "sampleText",
+                            "msgParam": json.dumps({"content": message}),
+                        }
+                    else:
+                        # Raw userId
+                        endpoint = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+                        payload = {
+                            "robotCode": client_id,
+                            "userIds": [chat_id],
+                            "msgKey": "sampleText",
+                            "msgParam": json.dumps({"content": message}),
+                        }
+
+                    send_resp = await client.post(
+                        endpoint,
+                        json=payload,
+                        headers={"x-acs-dingtalk-access-token": token},
+                    )
+                    send_resp.raise_for_status()
+                    data = send_resp.json()
+                    if data.get("errcode", 0) not in (0, None) and "processQueryKey" not in data:
+                        return {"error": f"DingTalk API error: {data}"}
+                    return {"success": True, "platform": "dingtalk", "chat_id": chat_id}
+            except Exception as e:
+                return {"error": f"DingTalk standalone send failed: {e}"}
+
         _extra_kwargs = dict(
             is_connected=_is_connected,
             validate_config=_is_connected,
@@ -539,7 +649,7 @@ def register(ctx: Any) -> None:
             allowed_users_env="DINGTALK_ALLOWED_USERS",
             allow_all_env="DINGTALK_ALLOW_ALL_USERS",
             cron_deliver_env_var="DINGTALK_HOME_CHANNEL",
-            standalone_sender_fn=_standalone_send,
+            standalone_sender_fn=_standalone_send_with_live_fallback,
             allow_update_command=True,
         )
     except Exception as e:
