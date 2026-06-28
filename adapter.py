@@ -265,8 +265,20 @@ def _build_adapter_class() -> type:
 
         # ── connect() — also register card callback handler ────────────────
 
-        async def connect(self) -> bool:
-            ok = await super().connect()
+        async def connect(self, *, is_reconnect: bool = False) -> bool:
+            """Connect to DingTalk and register the approval card callback.
+
+            Hermes v0.17 gateway calls platform adapters with
+            connect(is_reconnect=True) from the reconnect watcher. Keep this
+            override compatible with both new base adapters that accept the
+            kwarg and older DingTalk adapters that do not.
+            """
+            try:
+                ok = await super().connect(is_reconnect=is_reconnect)
+            except TypeError as e:
+                if "is_reconnect" not in str(e):
+                    raise
+                ok = await super().connect()
             if not ok:
                 return False
 
