@@ -339,12 +339,8 @@ def _build_adapter_class() -> type:
             session_webhook = metadata.get("session_webhook")
             if not session_webhook:
                 webhook_info = self._get_valid_webhook(chat_id)
-                if not webhook_info:
-                    return SendResult(
-                        success=False,
-                        error="No valid session_webhook available for image upload reply.",
-                    )
-                session_webhook, _ = webhook_info
+                if webhook_info:
+                    session_webhook, _ = webhook_info
 
             if not self._http_client:
                 return SendResult(success=False, error="HTTP client not initialized")
@@ -400,16 +396,58 @@ def _build_adapter_class() -> type:
                     except Exception:
                         logger.debug("[dingtalk-approval] Failed to send image caption", exc_info=True)
 
-                send_resp = await self._http_client.post(
-                    session_webhook,
-                    json={"msgtype": "image", "image": {"media_id": media_id}},
-                    timeout=15.0,
+                # DingTalk Stream session_webhook image messages require image.picURL;
+                # they reject uploaded media_id with 400802 "miss param: image->picURL".
+                # For local screenshots we therefore deliver via robot OpenAPI as a
+                # file attachment (sampleFile) using the uploaded media_id. It is not
+                # an inline image preview, but it reliably transfers the screenshot.
+                extra = getattr(self.config, "extra", {}) or {}
+                staff_id = (
+                    extra.get("home_user_id")
+                    or os.getenv("DINGTALK_HOME_USER_ID", "")
+                    or (extra.get("allowed_approvers", "") or "").split(",")[0].strip()
                 )
-                send_resp.raise_for_status()
-                data = send_resp.json() if send_resp.content else {}
-                if data.get("errcode", 0) not in (0, None):
-                    return SendResult(success=False, error=f"DingTalk image send error: {data}")
-                return SendResult(success=True, message_id=str(data.get("messageId", "")) or None)
+                if staff_id:
+                    token_v2_resp = await self._http_client.post(
+                        "https://api.dingtalk.com/v1.0/oauth2/accessToken",
+                        json={"appKey": client_id, "appSecret": client_secret},
+                        timeout=15.0,
+                    )
+                    token_v2_resp.raise_for_status()
+                    token_v2_data = token_v2_resp.json()
+                    token_v2 = token_v2_data.get("accessToken")
+                    if not token_v2:
+                        return SendResult(success=False, error=f"DingTalk v2 token missing: {token_v2_data}")
+
+                    send_resp = await self._http_client.post(
+                        "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+                        headers={"x-acs-dingtalk-access-token": token_v2},
+                        json={
+                            "robotCode": client_id,
+                            "userIds": [staff_id],
+                            "msgKey": "sampleFile",
+                            "msgParam": json.dumps({
+                                "mediaId": media_id,
+                                "fileName": path.name,
+                                "fileType": "image",
+                            }),
+                        },
+                        timeout=15.0,
+                    )
+                    send_resp.raise_for_status()
+                    data = send_resp.json() if send_resp.content else {}
+                    if data.get("errcode", 0) not in (0, None) and "processQueryKey" not in data:
+                        return SendResult(success=False, error=f"DingTalk image file send error: {data}")
+                    return SendResult(success=True, message_id=str(data.get("processQueryKey", "")) or None)
+
+                # Last resort: only public picURL works for session_webhook inline image.
+                return SendResult(
+                    success=False,
+                    error=(
+                        "DingTalk local image upload succeeded but no home_user_id is configured "
+                        "for OpenAPI sampleFile delivery; session_webhook image requires public picURL."
+                    ),
+                )
             except Exception as e:
                 logger.warning("[dingtalk-approval] Image upload/send failed: %s", e)
                 return SendResult(success=False, error=f"DingTalk image upload/send failed: {e}")
