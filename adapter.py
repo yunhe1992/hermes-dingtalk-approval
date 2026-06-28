@@ -520,25 +520,6 @@ def _build_adapter_class() -> type:
             if not media_id:
                 return SendResult(success=False, error=f"DingTalk image upload failed: {upload_data}")
 
-            webhook = metadata.get("session_webhook")
-            if not webhook:
-                webhook_info = self._get_valid_webhook(chat_id)
-                if webhook_info:
-                    webhook, _ = webhook_info
-
-            if webhook:
-                try:
-                    send_resp = await self._http_client.post(
-                        webhook,
-                        json={"msgtype": "image", "image": {"media_id": media_id}},
-                    )
-                    send_data = send_resp.json()
-                    if send_data.get("errcode", 0) in (0, None):
-                        return SendResult(success=True)
-                    logger.warning("[dingtalk-approval] Webhook image send failed, trying OpenAPI: %s", send_data)
-                except Exception as exc:
-                    logger.warning("[dingtalk-approval] Webhook image send failed, trying OpenAPI: %s", exc)
-
             result = await self._send_proactive_image(chat_id, media_id)
             if result.success:
                 logger.info("[dingtalk-approval] Sent DingTalk proactive image media: %s", os.path.basename(image_path))
