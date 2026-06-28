@@ -37,9 +37,10 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -233,9 +234,116 @@ def _get_base_dingtalk_adapter():
     )
     return DingTalkAdapter, check_dingtalk_requirements
 
+
+def _raw_content(message: Any) -> Any:
+    """Return DingTalk raw content from the callback payload, if preserved."""
+    raw = getattr(message, "_raw_data", None)
+    if not isinstance(raw, dict):
+        return None
+    content = raw.get("content")
+    if isinstance(content, str):
+        try:
+            return json.loads(content)
+        except Exception:
+            return None
+    return content
+
+
+def _rich_text_items(message: Any) -> List[Any]:
+    """Return rich-text items from SDK-normalized and raw callback shapes."""
+    candidates = []
+    rich_text = getattr(message, "rich_text_content", None) or getattr(
+        message, "rich_text", None
+    )
+    if rich_text:
+        candidates.append(rich_text)
+
+    raw = getattr(message, "_raw_data", None)
+    if isinstance(raw, dict):
+        content = raw.get("content")
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except Exception:
+                content = None
+        for container in (raw, content):
+            if not isinstance(container, dict):
+                continue
+            for key in (
+                "richText",
+                "rich_text",
+                "richTextContent",
+                "rich_text_content",
+                "richTextList",
+                "rich_text_list",
+            ):
+                value = container.get(key)
+                if value:
+                    candidates.append(value)
+        if isinstance(content, list):
+            candidates.append(content)
+
+    items: List[Any] = []
+    seen: Set[Any] = set()
+    for candidate in candidates:
+        rich_list = getattr(candidate, "rich_text_list", None)
+        if rich_list is None and isinstance(candidate, dict):
+            rich_list = (
+                candidate.get("rich_text_list")
+                or candidate.get("richTextList")
+                or candidate.get("richText")
+                or candidate.get("rich_text")
+            )
+        if rich_list is None:
+            rich_list = candidate
+        if isinstance(rich_list, list):
+            for item in rich_list:
+                if isinstance(item, dict):
+                    marker = (
+                        item.get("type"),
+                        item.get("downloadCode") or item.get("pictureDownloadCode") or item.get("download_code"),
+                        item.get("text") or item.get("content"),
+                    )
+                else:
+                    marker = id(item)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                items.append(item)
+    return items
+
+
+def _patch_chatbot_message_from_dict(DingTalkAdapter: type) -> None:
+    """Preserve raw DingTalk callback payloads without editing Hermes core."""
+    module = sys.modules.get(getattr(DingTalkAdapter, "__module__", ""))
+    chatbot_message = getattr(module, "ChatbotMessage", None) if module else None
+    if chatbot_message is None or getattr(chatbot_message, "_hermes_raw_data_patch", False):
+        return
+    original_from_dict = getattr(chatbot_message, "from_dict", None)
+    if not callable(original_from_dict):
+        return
+
+    def _from_dict_with_raw(data: Any) -> Any:
+        msg = original_from_dict(data)
+        if isinstance(data, dict):
+            try:
+                setattr(msg, "_raw_data", data)
+            except Exception:
+                pass
+        return msg
+
+    try:
+        setattr(chatbot_message, "from_dict", staticmethod(_from_dict_with_raw))
+        setattr(chatbot_message, "_hermes_raw_data_patch", True)
+        logger.info("[dingtalk-approval] Patched DingTalk ChatbotMessage.from_dict to preserve raw payloads")
+    except Exception as exc:
+        logger.warning("[dingtalk-approval] Could not patch ChatbotMessage.from_dict: %s", exc)
+
+
 def _build_adapter_class() -> type:
     DingTalkAdapter, _ = _get_base_dingtalk_adapter()
-    from gateway.platforms.base import SendResult
+    _patch_chatbot_message_from_dict(DingTalkAdapter)
+    from gateway.platforms.base import MessageType, SendResult
 
     CardCallbackHandlerClass = _build_card_callback_handler_class()
 
@@ -262,6 +370,61 @@ def _build_adapter_class() -> type:
                 or os.getenv("DINGTALK_ALLOWED_APPROVERS", "")
                 or ""
             )
+
+        @staticmethod
+        def _extract_text(message: Any) -> str:
+            """Extract text, preferring DingTalk native voice recognition when present."""
+            content = ""
+            try:
+                content = str(DingTalkAdapter._extract_text(message) or "").strip()
+            except Exception:
+                content = ""
+
+            if not content:
+                raw_content = _raw_content(message)
+                if isinstance(raw_content, dict):
+                    content = str(raw_content.get("recognition") or "").strip()
+
+            if not content:
+                parts = []
+                for item in _rich_text_items(message):
+                    if isinstance(item, dict):
+                        text = item.get("text") or item.get("content") or ""
+                        if text:
+                            parts.append(text)
+                    elif hasattr(item, "text") and item.text:
+                        parts.append(item.text)
+                content = " ".join(parts).strip()
+            return content
+
+        def _extract_media(self, message: Any):
+            """Skip Hermes STT when DingTalk already supplied recognition text."""
+            try:
+                msg_type, media_urls, media_types = DingTalkAdapter._extract_media(self, message)
+            except TypeError:
+                msg_type, media_urls, media_types = DingTalkAdapter._extract_media(message)
+
+            raw_content = _raw_content(message)
+            if isinstance(raw_content, dict):
+                dl_code = raw_content.get("downloadCode") or raw_content.get("download_code") or ""
+                raw_msg_type = (
+                    getattr(message, "message_type", "")
+                    or getattr(message, "msgtype", "")
+                    or ""
+                )
+                if dl_code and raw_msg_type == "audio":
+                    recognition = str(raw_content.get("recognition") or "").strip()
+                    if recognition:
+                        media_urls = [
+                            url for url in media_urls
+                            if url != dl_code and not str(url).endswith(str(dl_code))
+                        ]
+                        if not media_urls:
+                            return MessageType.TEXT, [], []
+                    elif not media_urls:
+                        return MessageType.VOICE, [dl_code], ["audio/ogg"]
+
+            return msg_type, media_urls, media_types
 
         # ── connect() — also register card callback handler ────────────────
 
@@ -327,130 +490,116 @@ def _build_adapter_class() -> type:
             metadata: Optional[Dict[str, Any]] = None,
             **kwargs: Any,
         ) -> "SendResult":
-            """Upload a local image to DingTalk and reply via session_webhook.
+            """Upload a local image and send it through DingTalk APIs.
 
-            DingTalk Stream session webhooks support image messages with a legacy
-            oapi media_id, but the base adapter intentionally returns a clear
-            failure because it has no upload implementation. Add it here so
-            MEDIA:/local.png generated by browser_vision can be delivered in the
-            same incoming DingTalk session.
+            This keeps screenshot/image delivery in the plugin instead of
+            relying on patched Hermes core DingTalk code.
             """
             metadata = metadata or {}
-            session_webhook = metadata.get("session_webhook")
-            if not session_webhook:
-                webhook_info = self._get_valid_webhook(chat_id)
-                if webhook_info:
-                    session_webhook, _ = webhook_info
-
             if not self._http_client:
                 return SendResult(success=False, error="HTTP client not initialized")
+            if not os.path.exists(image_path):
+                return SendResult(success=False, error=f"Image file not found: {image_path}")
 
-            client_id = getattr(self, "_client_id", "") or os.getenv("DINGTALK_CLIENT_ID", "")
-            client_secret = getattr(self, "_client_secret", "") or os.getenv("DINGTALK_CLIENT_SECRET", "")
-            if not (client_id and client_secret):
-                return SendResult(
-                    success=False,
-                    error="DingTalk image upload requires DINGTALK_CLIENT_ID and DINGTALK_CLIENT_SECRET.",
-                )
+            token = await self._get_access_token()
+            if not token:
+                return SendResult(success=False, error="Could not obtain DingTalk access token")
 
             try:
-                import mimetypes
-                from pathlib import Path
-
-                path = Path(image_path).expanduser()
-                if not path.exists() or not path.is_file():
-                    return SendResult(success=False, error=f"Image file not found: {image_path}")
-
-                token_resp = await self._http_client.get(
-                    "https://oapi.dingtalk.com/gettoken",
-                    params={"appkey": client_id, "appsecret": client_secret},
-                    timeout=15.0,
-                )
-                token_resp.raise_for_status()
-                token_data = token_resp.json()
-                if token_data.get("errcode", 0) != 0:
-                    return SendResult(success=False, error=f"DingTalk token error: {token_data}")
-                token = token_data.get("access_token")
-                if not token:
-                    return SendResult(success=False, error=f"DingTalk token missing: {token_data}")
-
-                mime = mimetypes.guess_type(str(path))[0] or "image/png"
-                with path.open("rb") as fh:
+                with open(image_path, "rb") as fh:
                     upload_resp = await self._http_client.post(
                         "https://oapi.dingtalk.com/media/upload",
                         params={"access_token": token, "type": "image"},
-                        files={"media": (path.name, fh, mime)},
-                        timeout=30.0,
+                        files={"media": (os.path.basename(image_path), fh, "image/png")},
                     )
-                upload_resp.raise_for_status()
                 upload_data = upload_resp.json()
-                if upload_data.get("errcode", 0) != 0:
-                    return SendResult(success=False, error=f"DingTalk media upload error: {upload_data}")
-                media_id = upload_data.get("media_id")
-                if not media_id:
-                    return SendResult(success=False, error=f"DingTalk media_id missing: {upload_data}")
+            except Exception as exc:
+                return SendResult(success=False, error=f"DingTalk image upload failed: {exc}")
 
-                if caption:
-                    try:
-                        await self.send(chat_id=chat_id, content=caption, metadata=metadata)
-                    except Exception:
-                        logger.debug("[dingtalk-approval] Failed to send image caption", exc_info=True)
+            media_id = upload_data.get("media_id") or upload_data.get("mediaId")
+            if not media_id:
+                return SendResult(success=False, error=f"DingTalk image upload failed: {upload_data}")
 
-                # DingTalk Stream session_webhook image messages require image.picURL;
-                # they reject uploaded media_id with 400802 "miss param: image->picURL".
-                # For local screenshots we therefore deliver via robot OpenAPI as a
-                # file attachment (sampleFile) using the uploaded media_id. It is not
-                # an inline image preview, but it reliably transfers the screenshot.
-                extra = getattr(self.config, "extra", {}) or {}
-                staff_id = (
-                    extra.get("home_user_id")
-                    or os.getenv("DINGTALK_HOME_USER_ID", "")
-                    or (extra.get("allowed_approvers", "") or "").split(",")[0].strip()
-                )
-                if staff_id:
-                    token_v2_resp = await self._http_client.post(
-                        "https://api.dingtalk.com/v1.0/oauth2/accessToken",
-                        json={"appKey": client_id, "appSecret": client_secret},
-                        timeout=15.0,
-                    )
-                    token_v2_resp.raise_for_status()
-                    token_v2_data = token_v2_resp.json()
-                    token_v2 = token_v2_data.get("accessToken")
-                    if not token_v2:
-                        return SendResult(success=False, error=f"DingTalk v2 token missing: {token_v2_data}")
+            webhook = metadata.get("session_webhook")
+            if not webhook:
+                webhook_info = self._get_valid_webhook(chat_id)
+                if webhook_info:
+                    webhook, _ = webhook_info
 
+            if webhook:
+                try:
                     send_resp = await self._http_client.post(
-                        "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
-                        headers={"x-acs-dingtalk-access-token": token_v2},
-                        json={
-                            "robotCode": client_id,
-                            "userIds": [staff_id],
-                            "msgKey": "sampleFile",
-                            "msgParam": json.dumps({
-                                "mediaId": media_id,
-                                "fileName": path.name,
-                                "fileType": "image",
-                            }),
-                        },
-                        timeout=15.0,
+                        webhook,
+                        json={"msgtype": "image", "image": {"media_id": media_id}},
                     )
-                    send_resp.raise_for_status()
-                    data = send_resp.json() if send_resp.content else {}
-                    if data.get("errcode", 0) not in (0, None) and "processQueryKey" not in data:
-                        return SendResult(success=False, error=f"DingTalk image file send error: {data}")
-                    return SendResult(success=True, message_id=str(data.get("processQueryKey", "")) or None)
+                    send_data = send_resp.json()
+                    if send_data.get("errcode", 0) in (0, None):
+                        return SendResult(success=True)
+                    logger.warning("[dingtalk-approval] Webhook image send failed, trying OpenAPI: %s", send_data)
+                except Exception as exc:
+                    logger.warning("[dingtalk-approval] Webhook image send failed, trying OpenAPI: %s", exc)
 
-                # Last resort: only public picURL works for session_webhook inline image.
-                return SendResult(
-                    success=False,
-                    error=(
-                        "DingTalk local image upload succeeded but no home_user_id is configured "
-                        "for OpenAPI sampleFile delivery; session_webhook image requires public picURL."
-                    ),
+            result = await self._send_proactive_image(chat_id, media_id)
+            if result.success:
+                logger.info("[dingtalk-approval] Sent DingTalk proactive image media: %s", os.path.basename(image_path))
+            return result
+
+        async def _send_proactive_image(self, chat_id: str, media_id: str) -> "SendResult":
+            extra = self.config.extra or {}
+            client_id = extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID", "")
+            client_secret = extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET", "")
+            if not (client_id and client_secret):
+                return SendResult(success=False, error="DingTalk client_id/client_secret not configured")
+
+            try:
+                token_resp = await self._http_client.post(
+                    "https://api.dingtalk.com/v1.0/oauth2/accessToken",
+                    json={"appKey": client_id, "appSecret": client_secret},
                 )
-            except Exception as e:
-                logger.warning("[dingtalk-approval] Image upload/send failed: %s", e)
-                return SendResult(success=False, error=f"DingTalk image upload/send failed: {e}")
+                token_data = token_resp.json()
+                api_token = token_data.get("accessToken")
+                if not api_token:
+                    return SendResult(success=False, error=f"DingTalk accessToken error: {token_data}")
+
+                targets = []
+                home_user_id = extra.get("home_user_id") or os.getenv("DINGTALK_HOME_USER_ID", "")
+                if home_user_id:
+                    targets.append(("user", home_user_id))
+                if not str(chat_id).startswith("cid"):
+                    targets.append(("user", chat_id))
+                else:
+                    targets.append(("group", chat_id))
+
+                last_error = ""
+                for kind, target in targets:
+                    if kind == "user":
+                        endpoint = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+                        payload = {
+                            "robotCode": client_id,
+                            "userIds": [target],
+                            "msgKey": "sampleImageMsg",
+                            "msgParam": json.dumps({"photoURL": media_id}),
+                        }
+                    else:
+                        endpoint = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+                        payload = {
+                            "robotCode": client_id,
+                            "openConversationId": target,
+                            "msgKey": "sampleImageMsg",
+                            "msgParam": json.dumps({"photoURL": media_id}),
+                        }
+                    resp = await self._http_client.post(
+                        endpoint,
+                        json=payload,
+                        headers={"x-acs-dingtalk-access-token": api_token},
+                    )
+                    data = resp.json()
+                    if data.get("errcode", 0) in (0, None) or data.get("processQueryKey"):
+                        return SendResult(success=True, message_id=data.get("processQueryKey"))
+                    last_error = str(data)
+                return SendResult(success=False, error=f"DingTalk proactive image send failed: {last_error}")
+            except Exception as exc:
+                return SendResult(success=False, error=f"DingTalk proactive image send failed: {exc}")
 
         # ── send_exec_approval() ────────────────────────────────────────────
 
