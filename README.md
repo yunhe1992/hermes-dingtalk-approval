@@ -41,6 +41,14 @@ DINGTALK_APPROVAL_TEMPLATE_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.schema
 DINGTALK_ALLOWED_APPROVERS=userid1,userid2
 ```
 
+## 效果展示
+
+用户在钉钉发送需要审批的危险命令请求后，会收到如下 AI Card：
+
+![审批卡片示例](docs/screenshots/approval-card-example.png)
+
+卡片展示命令预览（代码块）、触发原因，以及 4 个审批按钮：仅此次 / 本次会话 / 永久允许 / 拒绝。
+
 ## 卡片模板
 
 `card_template_export.json` 是从钉钉开放平台搭建器导出的完整模板文件，可直接导入使用。
