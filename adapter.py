@@ -591,8 +591,26 @@ def _build_adapter_class() -> type:
             session_key: str,
             description: str = "dangerous command",
             metadata: Optional[Dict[str, Any]] = None,
+            allow_permanent: bool = True,
+            allow_session: bool = True,
+            smart_denied: bool = False,
         ) -> "SendResult":
-            """Send an AI Card with 4 approval buttons."""
+            """Send an AI Card with up to 4 approval buttons.
+
+            Hermes v0.19 gateway.run passes allow_permanent / allow_session /
+            smart_denied kwargs to send_exec_approval() on every adapter
+            (see gateway/run.py ~line 20738). Without accepting them here the
+            call raises TypeError, the gateway silently falls back to the
+            text-only "/approve" flow, and the AI Card template never renders
+            — which looks like "the approval template stopped working".
+
+            The card template itself always exposes all 4 buttons (button
+            visibility is baked into the DingTalk card template config, not
+            controlled per-call), so allow_permanent/allow_session are
+            accepted for signature compatibility but don't change the
+            rendered card. smart_denied is surfaced in the card body so the
+            approver knows an owner override is scoped to this call only.
+            """
             tmpl = self._approval_template_id
             if not tmpl:
                 return SendResult(
@@ -623,6 +641,7 @@ def _build_adapter_class() -> type:
             content_md = (
                 f"**命令预览：**\n\n```\n{cmd_preview}\n```\n\n"
                 f"**原因：** {description}"
+                + ("\n\n⚠️ Smart DENY：本次为一次性豁免，不影响后续审批。" if smart_denied else "")
             )
 
             out_track_id = f"hermes-approval-{uuid.uuid4().hex[:12]}"
